@@ -1,7 +1,7 @@
 # Mihomo 基础模板 (由 start.sh / run_local.py 动态注入 proxy-providers 与 listeners)
 
 mode: rule
-log-level: warning
+log-level: info
 allow-lan: false
 bind-address: '*'
 ipv6: false
@@ -20,13 +20,14 @@ best: &best
   url: https://www.gstatic.com/generate_204
   interval: 180
   tolerance: 50
-  lazy: true
+  lazy: false
 
 # 基础策略组
 proxy-groups:
   - {name: 🚀 节点选择, type: select, proxies: [♻️ 自动选择, 🌐 全部节点, 🟢 直连]}
   - {name: ♻️ 自动选择, <<: *best, include-all: true, filter: "^((?!(直连|Direct|DIRECT)).)*$"}
   - {name: 🌐 全部节点, type: select, include-all: true, filter: "^((?!(直连|Direct|DIRECT)).)*$"}
+# __WORKER_GROUPS__  (由 mihomo_config.py 注入各 Worker 专属策略组，勿删除此标记)
 
 rules:
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve

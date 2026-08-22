@@ -209,6 +209,23 @@ Enable `DEBUG=true` to monitor real-time session fingerprints, routing decisions
 [DEBUG @ 21:05:26] [Req #2] Completed in 1.15s | HTTP 200 via Worker-2 (http://127.0.0.1:19002)
 ```
 
+### 3. Diagnostic & Troubleshooting Commands
+
+When diagnosing proxy node connectivity or checking internal worker logs:
+
+```bash
+# 1. View Mihomo kernel & subscription logs
+docker exec -it gemflow cat /tmp/mihomo.log
+# Or tail real-time proxy traffic
+docker exec -it gemflow tail -f /tmp/mihomo.log
+
+# 2. Test specific worker proxy port egress connectivity (e.g., Worker-2 on port 19002)
+docker exec -it gemflow curl -x http://127.0.0.1:19002 -s https://ipinfo.io/json
+
+# 3. Inspect individual upstream worker service logs (e.g., Worker-2)
+docker exec -it gemflow cat /app/worker_2.log
+```
+
 ---
 
 ## 📄 License

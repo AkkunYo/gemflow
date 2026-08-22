@@ -215,6 +215,23 @@ print()
 [DEBUG @ 21:05:26] [Req #2] Completed in 1.15s | HTTP 200 via Worker-2 (http://127.0.0.1:19002)
 ```
 
+### 3. 故障排查与连通性自检命令
+
+当遇到代理出口未生效、节点测速异常或需要查看实例内部状态时：
+
+```bash
+# 1. 查看 Mihomo 代理内核与订阅拉取日志
+docker exec -it gemflow cat /tmp/mihomo.log
+# 或实时滚动追踪代理日志
+docker exec -it gemflow tail -f /tmp/mihomo.log
+
+# 2. 手动测试指定 Worker 代理端口的出口连通性 (以 Worker-2 对应的 19002 为例)
+docker exec -it gemflow curl -x http://127.0.0.1:19002 -s https://ipinfo.io/json
+
+# 3. 查看特定 Worker 实例的上游运行日志 (以 Worker-2 为例)
+docker exec -it gemflow cat /app/worker_2.log
+```
+
 ---
 
 ## 📄 开源协议

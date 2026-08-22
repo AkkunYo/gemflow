@@ -65,9 +65,10 @@ def load_workers(config_path="workers.json"):
             if wid not in WORKER_STATUS:
                 WORKER_STATUS[wid] = {"last_fail": 0, "fail_count": 0}
 
-    print(f"[LB] Loaded {len(WORKERS)} worker(s): " + ", ".join(
-        f"Worker-{w['id']}: Port {w['port']} [{w.get('proxy') or 'DIRECT'}]" for w in WORKERS
-    ))
+    # 各 Worker 的端口与出口路由已由启动脚本逐行打印，此处只报总数避免重复长行输出
+    proxied = sum(1 for w in WORKERS if w.get("proxy"))
+    print(f"[LB] Loaded {len(WORKERS)} worker(s) "
+          f"({proxied} proxied, {len(WORKERS) - proxied} direct).", flush=True)
 
 
 def cleanup_stale_sessions():
@@ -357,6 +358,170 @@ class LBProxyHandler(BaseHTTPRequestHandler):
                 return
 
 
+def probe_single_worker_egress(worker, timeout=5):
+    """探测单个 Worker 实例的实际出口 IP 与归属地信息"""
+    wid = worker["id"]
+    wport = worker["port"]
+    proxy = worker.get("proxy")
+
+    if proxy:
+        port_str = proxy.rstrip("/").split(":")[-1]
+        route_desc = f"Proxy (:{port_str})"
+    else:
+        route_desc = "DIRECT (Native)"
+
+    headers = {"User-Agent": "gemflow-egress-probe/1.0"}
+    if proxy:
+        proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
+    info_str = "Unknown / Probe Failed"
+    # 1. 尝试 ip-api.com (HTTP, 免 API Key)
+    try:
+        req = urllib.request.Request("http://ip-api.com/json", headers=headers)
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "success":
+                    country = data.get("country", "Unknown")
+                    city = data.get("city", "")
+                    query = data.get("query", "Unknown")
+                    org = data.get("org") or data.get("isp") or "Unknown"
+                    location = f"{country} ({city})" if city else country
+                    info_str = f"{location} - IP: {query} [{org}]"
+                    return f"[{f'Worker-{wid} : Port {wport} : {route_desc}':<38}] -> {info_str}"
+    except Exception:
+        pass
+
+    # 2. 兜底尝试 ipinfo.io (HTTPS)
+    try:
+        req = urllib.request.Request("https://ipinfo.io/json", headers=headers)
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                ip = data.get("ip", "Unknown")
+                country = data.get("country", "Unknown")
+                city = data.get("city", "")
+                org = data.get("org", "Unknown")
+                location = f"{country} ({city})" if city else country
+                info_str = f"{location} - IP: {ip} [{org}]"
+                return f"[{f'Worker-{wid} : Port {wport} : {route_desc}':<38}] -> {info_str}"
+    except Exception as e:
+        info_str = f"Connection Failed ({type(e).__name__})"
+
+    return f"[{f'Worker-{wid} : Port {wport} : {route_desc}':<38}] -> {info_str}"
+
+
+def evaluate_egress_readiness(workers, results):
+    """
+    判定本轮探测是否代表"代理链路已生效"，可以打印首次状态面板。
+
+    纯函数，便于单测。判定口径：
+    - 所有 Worker 探测均成功（无连接/探测失败）
+    - 若同时存在直连 Worker，则代理 Worker 至少有一个出口 IP 与原生直连 IP 不同
+      （用于排除 mihomo 尚未就绪、代理端口实际回落直连的情况）
+
+    不要求各代理出口 IP 互不相同：健康节点少于 Worker 数时轮转复用是合法结果。
+    """
+    ip_by_wid = {}
+    for wid, line in results:
+        if "IP: " in line:
+            ip_by_wid[wid] = line.split("IP: ")[1].split()[0]
+
+    has_failed = any("Connection Failed" in line or "Probe Failed" in line
+                     for _, line in results)
+    if has_failed or not results:
+        return False
+
+    proxy_wids = {w["id"] for w in workers if w.get("proxy")}
+    direct_wids = {w["id"] for w in workers if not w.get("proxy")}
+
+    if not proxy_wids:
+        return True
+
+    proxy_ips = {ip_by_wid[wid] for wid in proxy_wids if wid in ip_by_wid}
+    if not proxy_ips:
+        return False
+
+    direct_ips = {ip_by_wid[wid] for wid in direct_wids if wid in ip_by_wid}
+    if direct_ips:
+        return bool(proxy_ips - direct_ips)
+
+    return True
+
+
+def async_inspect_egress_ips(initial_delay=3.0, poll_interval=300.0,
+                             first_print_deadline=180.0):
+    """
+    后台异步守护线程：
+    持续探测各 Worker 出口 IP，每轮探测成功后打印完整状态面板。
+
+    首次打印需等待代理链路实际生效（见 evaluate_egress_readiness），
+    但最长只等待 first_print_deadline 秒，超时后无条件打印当前实况，
+    避免节点异常时状态面板永久静默；此后每 poll_interval 周期打印一次。
+    """
+    def _worker_task():
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+
+        has_ever_printed = False
+        started_at = time.time()
+
+        while True:
+            with LOCK:
+                workers_copy = list(WORKERS)
+            if not workers_copy:
+                time.sleep(poll_interval)
+                continue
+
+            results = []
+            threads = []
+            res_lock = threading.Lock()
+
+            def _probe_w(w):
+                res = probe_single_worker_egress(w)
+                with res_lock:
+                    results.append((w["id"], res))
+
+            for w in workers_copy:
+                t = threading.Thread(target=_probe_w, args=(w,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=8)
+
+            results.sort(key=lambda x: x[0])
+
+            if has_ever_printed:
+                # 稳定期：每轮如实打印当前出口实况
+                should_print = True
+            elif evaluate_egress_readiness(workers_copy, results):
+                should_print = True
+            else:
+                # 代理链路迟迟未生效时，超过截止时间也打印一次实况便于排查
+                should_print = (time.time() - started_at) >= first_print_deadline
+                if should_print:
+                    print("[LB] Warning: proxy egress not confirmed within "
+                          f"{int(first_print_deadline)}s. Printing current state as-is.",
+                          flush=True)
+
+            if should_print:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                print("\n" + f"========== [Worker Egress IP Status @ {timestamp}] ==========", flush=True)
+                for _, line in results:
+                    print(line, flush=True)
+                print("=" * 70 + "\n", flush=True)
+                has_ever_printed = True
+
+            time.sleep(5.0 if not has_ever_printed else poll_interval)
+
+    t = threading.Thread(target=_worker_task, daemon=True)
+    t.start()
+
+
 def start_lb_server(port=8081, config_path="workers.json", debug=False):
     global DEBUG_ENABLED
     DEBUG_ENABLED = debug
@@ -364,6 +529,9 @@ def start_lb_server(port=8081, config_path="workers.json", debug=False):
         print("[LB] >>> DEBUG logging mode is ENABLED <<<", flush=True)
 
     load_workers(config_path)
+
+    # 启动后台异步出口 IP 探测
+    async_inspect_egress_ips(initial_delay=15.0)
 
     def timer_loop():
         while True:

@@ -14,9 +14,13 @@ import time
 import json
 import signal
 import shutil
+import glob
 import argparse
 import subprocess
 import urllib.request
+
+import mihomo_config
+import assign_worker_nodes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKERS_JSON = os.path.join(BASE_DIR, "workers.json")
@@ -124,41 +128,20 @@ def detect_is_cn_host():
 
 
 def generate_mihomo_config(worker_count, sub_urls):
-    if not os.path.exists(TEMPLATE_YAML):
-        print(f"[Warning] Template {TEMPLATE_YAML} not found. Skipping proxy setup.")
+    """渲染 Mihomo 运行配置 (与容器启动路径共用 mihomo_config 渲染器)"""
+    # 清除旧 provider 缓存，确保每次启动都从订阅 URL 拉取最新节点
+    for stale in glob.glob(os.path.join(BASE_DIR, "sub-*.yaml")):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    try:
+        mihomo_config.write_config(TEMPLATE_YAML, MIHOMO_CONFIG, worker_count,
+                                   sub_urls, BASE_PROXY_PORT)
+    except Exception as e:
+        print(f"[Warning] Failed to render Mihomo config: {e}. Skipping proxy setup.")
         return False
-
-    with open(TEMPLATE_YAML, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    providers_block = "\nproxy-providers:\n"
-    for idx, url in enumerate(sub_urls, start=1):
-        url = url.strip()
-        if not url:
-            continue
-        providers_block += f"""  sub-{idx}:
-    type: http
-    url: "{url}"
-    interval: 3600
-    path: ./sub-{idx}.yaml
-    health-check:
-      enable: true
-      interval: 180
-      url: https://www.gstatic.com/generate_204
-"""
-
-    listeners_block = "\nlisteners:\n"
-    for i in range(worker_count):
-        proxy_port = BASE_PROXY_PORT + i + 1
-        listeners_block += f"""  - name: mixed-{proxy_port}
-    type: mixed
-    port: {proxy_port}
-    proxy: 🚀 节点选择
-"""
-
-    full_yaml = content + providers_block + listeners_block
-    with open(MIHOMO_CONFIG, "w", encoding="utf-8") as f:
-        f.write(full_yaml)
 
     return True
 
@@ -238,6 +221,16 @@ def main():
     print(f"[gemflow] Created {WORKERS_JSON} with {len(workers)} worker(s):")
     for w in workers:
         print(f"  -> Worker-{w['id']}: Port {w['port']} [Egress: {w['proxy'] or 'DIRECT'}]")
+
+    # 2.1 为各 Worker 策略组绑定互不相同的出口节点
+    if use_proxies:
+        direct_ids = [w["id"] for w in workers if not w.get("proxy")]
+        try:
+            assign_worker_nodes.assign(worker_count=args.workers,
+                                       skip_worker_ids=direct_ids,
+                                       max_wait=45.0)
+        except Exception as e:
+            print(f"[NodeAssign] Skipped due to error: {e}")
 
     # 3. 检查/拉取并启动 gemini_web2api 实例
     web2api_script = os.path.join(BASE_DIR, "gemini_web2api.py")

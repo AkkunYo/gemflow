@@ -147,5 +147,63 @@ class TestGatewayCore(unittest.TestCase):
             lb_gateway.MAX_SESSIONS = orig_max
 
 
+    def test_probe_single_worker_egress(self):
+        worker = {"id": 1, "port": 9001, "proxy": None}
+        res = lb_gateway.probe_single_worker_egress(worker, timeout=1)
+        self.assertTrue("Worker-1" in res)
+        self.assertTrue("Port 9001" in res)
+
+
+def _line(wid, ip):
+    return (wid, f"[Worker-{wid} : Port 900{wid} : x] -> United States (Ashburn) - IP: {ip} [ISP]")
+
+
+class TestEgressReadiness(unittest.TestCase):
+    """首次打印门控：确认代理链路真正生效后才输出状态面板"""
+
+    DIRECT_W = {"id": 1, "port": 9001, "proxy": None}
+
+    @staticmethod
+    def _proxy_w(wid):
+        return {"id": wid, "port": 9000 + wid, "proxy": f"http://127.0.0.1:1900{wid}"}
+
+    def test_not_ready_when_proxy_falls_back_to_direct_ip(self):
+        """代理端口出口与原生直连完全相同 => mihomo 未生效，不该打印"""
+        workers = [self.DIRECT_W, self._proxy_w(2), self._proxy_w(3)]
+        results = [_line(1, "44.196.116.2"), _line(2, "44.196.116.2"), _line(3, "44.196.116.2")]
+        self.assertFalse(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_ready_when_proxy_ip_differs_from_direct(self):
+        workers = [self.DIRECT_W, self._proxy_w(2), self._proxy_w(3)]
+        results = [_line(1, "44.196.116.2"), _line(2, "137.131.35.71"), _line(3, "5.6.7.8")]
+        self.assertTrue(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_ready_when_proxies_share_node_but_differ_from_direct(self):
+        """健康节点少于 Worker 数时轮转复用是合法结果，不应卡住首次打印"""
+        workers = [self.DIRECT_W, self._proxy_w(2), self._proxy_w(3)]
+        results = [_line(1, "44.196.116.2"), _line(2, "137.131.35.71"), _line(3, "137.131.35.71")]
+        self.assertTrue(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_ready_with_single_proxy_worker_and_no_direct(self):
+        """全代理且仅 1 个 Worker：无从比较，探测成功即视为就绪"""
+        workers = [self._proxy_w(1)]
+        results = [_line(1, "137.131.35.71")]
+        self.assertTrue(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_ready_in_direct_only_mode(self):
+        workers = [self.DIRECT_W]
+        results = [_line(1, "44.196.116.2")]
+        self.assertTrue(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_not_ready_when_any_probe_failed(self):
+        workers = [self.DIRECT_W, self._proxy_w(2)]
+        results = [_line(1, "44.196.116.2"),
+                   (2, "[Worker-2 : Port 9002 : x] -> Connection Failed (URLError)")]
+        self.assertFalse(lb_gateway.evaluate_egress_readiness(workers, results))
+
+    def test_not_ready_on_empty_results(self):
+        self.assertFalse(lb_gateway.evaluate_egress_readiness([self.DIRECT_W], []))
+
+
 if __name__ == "__main__":
     unittest.main()

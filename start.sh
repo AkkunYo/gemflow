@@ -89,51 +89,30 @@ fi
 
 if [ -n "$PROVIDER_URLS" ]; then
     echo "[Mihomo] Generating proxy configuration for $WORKER_COUNT workers..."
-    cp "$APP_DIR/mihomo.template.yaml" "$MIHOMO_CONFIG"
 
-    # 注入 proxy-providers
-    echo "proxy-providers:" >> "$MIHOMO_CONFIG"
-    P_INDEX=1
-    echo "$PROVIDER_URLS" | while IFS= read -r url || [ -n "$url" ]; do
-        url=$(echo "$url" | tr -d '\r' | xargs)
-        if [ -n "$url" ]; then
-            cat <<EOF >> "$MIHOMO_CONFIG"
-  sub-$P_INDEX:
-    type: http
-    url: "$url"
-    interval: 3600
-    path: ./sub-$P_INDEX.yaml
-    health-check:
-      enable: true
-      interval: 180
-      url: https://www.gstatic.com/generate_204
-EOF
-            P_INDEX=$((P_INDEX + 1))
+    # 清除旧 provider 缓存文件，确保每次启动从订阅 URL 拉取最新节点
+    rm -f "$APP_DIR"/sub-*.yaml
+
+    # 由 mihomo_config.py 统一渲染 Worker 专属策略组 / providers / listeners
+    if python3 "$APP_DIR/mihomo_config.py" \
+        --template "$APP_DIR/mihomo.template.yaml" \
+        --out "$MIHOMO_CONFIG" \
+        --workers "$WORKER_COUNT" \
+        --base-proxy-port "$BASE_PROXY_PORT"; then
+
+        echo "[Mihomo] Starting mihomo daemon..."
+        mihomo -d "$APP_DIR" -f "$MIHOMO_CONFIG" > /tmp/mihomo.log 2>&1 &
+        MIHOMO_PID=$!
+        sleep 10
+
+        if kill -0 "$MIHOMO_PID" 2>/dev/null; then
+            echo "[Mihomo] Started successfully (PID $MIHOMO_PID)."
+            USE_PROXIES=true
+        else
+            echo "[Mihomo] Warning: mihomo failed to start. Falling back to direct native routing."
         fi
-    done
-
-    # 注入 listeners (为所有 Worker 1..N 创建专属端口 19001..19000+N)
-    echo "listeners:" >> "$MIHOMO_CONFIG"
-    for ((i=0; i<WORKER_COUNT; i++)); do
-        PROXY_PORT=$((BASE_PROXY_PORT + i + 1))
-        cat <<EOF >> "$MIHOMO_CONFIG"
-  - name: mixed-$PROXY_PORT
-    type: mixed
-    port: $PROXY_PORT
-    proxy: 🚀 节点选择
-EOF
-    done
-
-    echo "[Mihomo] Starting mihomo daemon..."
-    mihomo -d "$APP_DIR" -f "$MIHOMO_CONFIG" > /tmp/mihomo.log 2>&1 &
-    MIHOMO_PID=$!
-    sleep 3
-
-    if kill -0 "$MIHOMO_PID" 2>/dev/null; then
-        echo "[Mihomo] Started successfully (PID $MIHOMO_PID)."
-        USE_PROXIES=true
     else
-        echo "[Mihomo] Warning: mihomo failed to start. Falling back to direct native routing."
+        echo "[Mihomo] Warning: failed to render config. Falling back to direct native routing."
     fi
 else
     echo "[Info] Running in DIRECT mode (No subscription provided)."
@@ -164,8 +143,17 @@ for ((i=0; i<WORKER_COUNT; i++)); do
 done
 echo "]}" >> "$WORKERS_JSON"
 
-echo "[LB] Generated workers config ($WORKERS_JSON):"
-cat "$WORKERS_JSON"
+# 2.1 为各 Worker 策略组分配互不相同的出口节点
+if [ "$USE_PROXIES" = "true" ]; then
+    SKIP_IDS=""
+    if [ "$IS_CN_HOST" != "true" ]; then
+        SKIP_IDS="1"
+    fi
+    python3 "$APP_DIR/assign_worker_nodes.py" \
+        --workers "$WORKER_COUNT" \
+        --skip "$SKIP_IDS" \
+        --max-wait 45 || echo "[NodeAssign] Skipped due to error; workers share the auto-select egress."
+fi
 
 # 3. 启动所有 gemini_web2api 实例
 for ((i=0; i<WORKER_COUNT; i++)); do
